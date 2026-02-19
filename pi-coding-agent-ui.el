@@ -83,15 +83,8 @@
 
 ;;;; Customization
 
-(defcustom pi-coding-agent-executable '("pi")
-  "Command to invoke the pi binary, as a list of strings.
-The first element is the program; remaining elements are passed
-before \"--mode rpc\" and `pi-coding-agent-extra-args'.
-
-For npx users:
-  (setq pi-coding-agent-executable \\='(\"npx\" \"pi\"))"
-  :type '(repeat string)
-  :group 'pi-coding-agent)
+;; pi-coding-agent-executable is defined in pi-coding-agent-core.el
+;; (required by this file) so it's available here for check-pi etc.
 
 (defcustom pi-coding-agent-rpc-timeout 30
   "Default timeout in seconds for synchronous RPC calls.

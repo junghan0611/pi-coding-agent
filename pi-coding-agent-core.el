@@ -214,7 +214,15 @@ containing EVENT, then clears this process's pending request tables."
     (when pending-types
       (clrhash pending-types))))
 
-(defvar pi-coding-agent-executable)  ; forward decl — core.el cannot require ui.el
+(defcustom pi-coding-agent-executable '("pi")
+  "Command to invoke the pi binary, as a list of strings.
+The first element is the program; remaining elements are passed
+before \"--mode rpc\" and `pi-coding-agent-extra-args'.
+
+For npx users:
+  (setq pi-coding-agent-executable \\='(\"npx\" \"pi\"))"
+  :type '(repeat string)
+  :group 'pi-coding-agent)
 
 (defvar pi-coding-agent-extra-args nil
   "Extra arguments to pass to the pi command.
@@ -224,9 +232,70 @@ Example: (setq pi-coding-agent-extra-args \\='(\"-e\" \"/path/to/ext.ts\"))
 
 This is useful for testing extensions or passing additional flags.")
 
+(defcustom pi-coding-agent-lock-wait-timeout 3.0
+  "Maximum seconds to wait for settings lock before starting pi.
+The pi binary uses `lockSync' with no retries, so if another pi
+instance holds the settings lock at startup, this instance fails
+to load settings (no model, no response).  This wait ensures the
+lock is released before spawning the process.
+
+Set to 0 to disable waiting."
+  :type 'number
+  :group 'pi-coding-agent)
+
+(defun pi-coding-agent--settings-lock-dirs (directory)
+  "Return lock directory paths for DIRECTORY's pi session.
+Pi uses `proper-lockfile' which creates `settings.json.lock'
+directories for both global (~/.pi/agent/) and project-local
+(<directory>/.pi/) settings."
+  (list (expand-file-name "agent/settings.json.lock"
+                          (expand-file-name ".pi/" "~"))
+        (expand-file-name ".pi/settings.json.lock" directory)))
+
+(defun pi-coding-agent--wait-for-lock (lock-dir)
+  "Wait for a single LOCK-DIR to be released.
+Stale locks (older than 10s) are removed immediately.
+Active locks are polled every 100ms up to
+`pi-coding-agent-lock-wait-timeout' seconds, then force-removed."
+  (let ((interval 0.1))
+    (when (file-directory-p lock-dir)
+      (let* ((attrs (file-attributes lock-dir))
+             (mtime (float-time (file-attribute-modification-time attrs)))
+             (age (- (float-time) mtime)))
+        (cond
+         ;; Stale lock (>10s, matches proper-lockfile default)
+         ((> age 10)
+          (delete-directory lock-dir t)
+          (message "pi: removed stale lock %s (age: %.0fs)"
+                   (file-name-nondirectory
+                    (directory-file-name (file-name-directory lock-dir)))
+                   age))
+         ;; Active lock — poll until released or timeout
+         (t
+          (let ((waited 0.0))
+            (while (and (file-directory-p lock-dir)
+                        (< waited pi-coding-agent-lock-wait-timeout))
+              (sleep-for interval)
+              (setq waited (+ waited interval)))
+            (when (file-directory-p lock-dir)
+              (delete-directory lock-dir t)
+              (message "pi: force-removed lock after %.1fs" waited)))))))))
+
+(defun pi-coding-agent--wait-for-settings-lock (directory)
+  "Wait for all settings locks to clear for DIRECTORY.
+Checks both global (~/.pi/agent/) and project-local (<dir>/.pi/)
+lock directories."
+  (when (> pi-coding-agent-lock-wait-timeout 0)
+    (dolist (lock-dir (pi-coding-agent--settings-lock-dirs directory))
+      (pi-coding-agent--wait-for-lock lock-dir))))
+
 (defun pi-coding-agent--start-process (directory)
   "Start pi RPC process in DIRECTORY.
+Waits for any settings lock to clear before starting, since the pi
+binary uses `lockSync' with no retries and will fail to load settings
+if the lock is held by another instance.
 Returns the process object."
+  (pi-coding-agent--wait-for-settings-lock directory)
   (let ((default-directory directory))
     (make-process
      :name "pi"

@@ -598,8 +598,8 @@ Display is handled by the display handler, not by state updates."
 
 (defun pi-coding-agent-test--capture-process-command (executable extra-args)
   "Return the command list that `--start-process' would pass to make-process.
-Mocks `make-process' to capture :command, binding
-`pi-coding-agent-executable' to EXECUTABLE and
+Mocks `make-process' and `--wait-for-settings-lock' to capture :command,
+binding `pi-coding-agent-executable' to EXECUTABLE and
 `pi-coding-agent-extra-args' to EXTRA-ARGS."
   (let ((pi-coding-agent-executable executable)
         (pi-coding-agent-extra-args extra-args)
@@ -607,7 +607,9 @@ Mocks `make-process' to capture :command, binding
     (cl-letf (((symbol-function 'make-process)
                (lambda (&rest args)
                  (setq captured (plist-get args :command))
-                 nil)))
+                 nil))
+              ((symbol-function 'pi-coding-agent--wait-for-settings-lock)
+               #'ignore))
       (ignore-errors (pi-coding-agent--start-process "/tmp/")))
     captured))
 
@@ -638,6 +640,116 @@ redisplay cycle instead of triggering N separate redraws."
            fake-proc "{\"type\":\"agent_start\"}\n")
           (should (eq captured-inhibit t)))
       (delete-process fake-proc))))
+
+;;;; Settings Lock Wait Tests
+
+(ert-deftest pi-coding-agent-test-lock-dirs-includes-global-and-project ()
+  "Lock dirs include both global and project-local paths."
+  (let ((dirs (pi-coding-agent--settings-lock-dirs "/home/user/myproject/")))
+    (should (= (length dirs) 2))
+    (should (string-suffix-p ".pi/agent/settings.json.lock" (nth 0 dirs)))
+    (should (string-suffix-p "myproject/.pi/settings.json.lock" (nth 1 dirs)))))
+
+(ert-deftest pi-coding-agent-test-wait-lock-no-lock-is-noop ()
+  "When no lock directory exists, wait returns immediately."
+  (let ((pi-coding-agent-lock-wait-timeout 3.0)
+        (start (float-time)))
+    (pi-coding-agent--wait-for-lock "/tmp/pi-test-nonexistent.lock")
+    ;; Should complete in under 50ms
+    (should (< (- (float-time) start) 0.05))))
+
+(ert-deftest pi-coding-agent-test-wait-lock-stale-removed ()
+  "Stale lock (>10s old) is removed immediately."
+  (let* ((pi-coding-agent-lock-wait-timeout 3.0)
+         (lock-dir (make-temp-file "pi-test-stale-lock" t ".lock")))
+    (unwind-protect
+        (progn
+          ;; Age the lock to 15 seconds
+          (set-file-times lock-dir (time-subtract (current-time) 15))
+          (pi-coding-agent--wait-for-lock lock-dir)
+          (should-not (file-directory-p lock-dir)))
+      (ignore-errors (delete-directory lock-dir t)))))
+
+(ert-deftest pi-coding-agent-test-wait-lock-active-waits-then-proceeds ()
+  "Active lock causes polling; proceeds once lock is released."
+  (let* ((pi-coding-agent-lock-wait-timeout 3.0)
+         (lock-dir (make-temp-file "pi-test-active-lock" t ".lock"))
+         (start (float-time)))
+    (unwind-protect
+        (progn
+          ;; Schedule lock removal after 200ms
+          (run-at-time 0.2 nil (lambda () (delete-directory lock-dir t)))
+          (pi-coding-agent--wait-for-lock lock-dir)
+          (let ((elapsed (- (float-time) start)))
+            ;; Should have waited at least ~200ms but less than timeout
+            (should (>= elapsed 0.1))
+            (should (< elapsed 2.0))))
+      (ignore-errors (delete-directory lock-dir t)))))
+
+(ert-deftest pi-coding-agent-test-wait-lock-timeout-force-removes ()
+  "Lock that exceeds timeout is force-removed."
+  (let* ((pi-coding-agent-lock-wait-timeout 0.3)  ; Short timeout for test
+         (lock-dir (make-temp-file "pi-test-stuck-lock" t ".lock")))
+    (unwind-protect
+        (progn
+          (pi-coding-agent--wait-for-lock lock-dir)
+          ;; Lock should be force-removed after timeout
+          (should-not (file-directory-p lock-dir)))
+      (ignore-errors (delete-directory lock-dir t)))))
+
+(ert-deftest pi-coding-agent-test-wait-lock-disabled-when-zero ()
+  "Lock wait is skipped when timeout is set to 0."
+  (let* ((pi-coding-agent-lock-wait-timeout 0)
+         (lock-dir (make-temp-file "pi-test-skip-lock" t ".lock"))
+         (start (float-time)))
+    (unwind-protect
+        (progn
+          (pi-coding-agent--wait-for-settings-lock "/tmp/")
+          ;; Should skip immediately without touching the lock
+          (should (< (- (float-time) start) 0.05))
+          (should (file-directory-p lock-dir)))
+      (ignore-errors (delete-directory lock-dir t)))))
+
+(ert-deftest pi-coding-agent-test-wait-settings-lock-checks-both ()
+  "wait-for-settings-lock checks global and project locks."
+  (let* ((pi-coding-agent-lock-wait-timeout 3.0)
+         (global-lock (make-temp-file "pi-test-global" t ".lock"))
+         (project-dir (make-temp-file "pi-test-proj" t))
+         (project-lock (expand-file-name ".pi/settings.json.lock" project-dir))
+         (checked nil))
+    (unwind-protect
+        (progn
+          ;; Age the global lock so it gets removed as stale
+          (set-file-times global-lock (time-subtract (current-time) 15))
+          ;; Create project lock dir
+          (make-directory project-lock t)
+          (set-file-times project-lock (time-subtract (current-time) 15))
+          (cl-letf (((symbol-function 'pi-coding-agent--settings-lock-dirs)
+                     (lambda (_dir) (list global-lock project-lock))))
+            (pi-coding-agent--wait-for-settings-lock project-dir))
+          ;; Both should be cleaned
+          (should-not (file-directory-p global-lock))
+          (should-not (file-directory-p project-lock)))
+      (ignore-errors (delete-directory global-lock t))
+      (ignore-errors (delete-directory project-dir t)))))
+
+(ert-deftest pi-coding-agent-test-start-process-waits-for-lock ()
+  "start-process calls lock wait before spawning process."
+  (let ((pi-coding-agent-executable '("pi"))
+        (pi-coding-agent-extra-args nil)
+        (pi-coding-agent-lock-wait-timeout 3.0)
+        (lock-waited nil)
+        (process-started nil))
+    (cl-letf (((symbol-function 'pi-coding-agent--wait-for-settings-lock)
+               (lambda (_dir) (setq lock-waited t)))
+              ((symbol-function 'make-process)
+               (lambda (&rest _)
+                 (setq process-started t)
+                 nil)))
+      (ignore-errors (pi-coding-agent--start-process "/tmp/")))
+    ;; Lock wait must happen, and must happen before process start
+    (should lock-waited)
+    (should process-started)))
 
 (provide 'pi-coding-agent-core-test)
 ;;; pi-coding-agent-core-test.el ends here
